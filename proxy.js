@@ -5,6 +5,7 @@
  * Modes:
  * 1. anthropic  - forward Anthropic-compatible requests after model remapping.
  * 2. responses  - translate Anthropic Messages requests to OpenAI Responses API.
+ * 3. openai     - translate Anthropic Messages requests to OpenAI Chat Completions API.
  */
 
 'use strict';
@@ -14,6 +15,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const zlib = require('zlib');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 基础配置
@@ -275,7 +277,7 @@ function loadRoutes() {
       console.error(`[proxy] routes.json 条目 "${aliasName}" 缺字段，需要 apiFormat/baseUrl/secretId/targetModel`);
       continue;
     }
-    if (apiFormat !== 'anthropic' && apiFormat !== 'responses') {
+    if (apiFormat !== 'anthropic' && apiFormat !== 'responses' && apiFormat !== 'openai') {
       console.error(`[proxy] routes.json 条目 "${aliasName}" apiFormat 非法: ${apiFormat}`);
       continue;
     }
@@ -494,12 +496,24 @@ function sendProxyError(res, statusCode, message) {
 
 function readResponseBody(proxyRes) {
   return new Promise((resolve, reject) => {
+    // Handle compressed responses
+    const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+    let stream = proxyRes;
+    
+    if (encoding === 'gzip' || encoding === 'x-gzip') {
+      stream = proxyRes.pipe(zlib.createGunzip());
+    } else if (encoding === 'deflate') {
+      stream = proxyRes.pipe(zlib.createInflate());
+    } else if (encoding === 'br') {
+      stream = proxyRes.pipe(zlib.createBrotliDecompress());
+    }
+    
     let data = '';
-    proxyRes.on('data', chunk => {
+    stream.on('data', chunk => {
       data += chunk.toString('utf8');
     });
-    proxyRes.on('end', () => resolve(data));
-    proxyRes.on('error', reject);
+    stream.on('end', () => resolve(data));
+    stream.on('error', reject);
   });
 }
 
@@ -582,6 +596,7 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
     proxyRes => {
       const resHeaders = { ...proxyRes.headers };
       delete resHeaders['transfer-encoding'];
+      delete resHeaders['content-encoding'];  // Remove compression header (Node.js auto-decompresses)
 
       if (proxyRes.statusCode >= 400) {
         readResponseBody(proxyRes).then(errData => {
@@ -599,11 +614,23 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
       if (isStream) {
         res.writeHead(proxyRes.statusCode, resHeaders);
 
+        // Handle compressed streaming responses
+        const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
+        let stream = proxyRes;
+        
+        if (encoding === 'gzip' || encoding === 'x-gzip') {
+          stream = proxyRes.pipe(zlib.createGunzip());
+        } else if (encoding === 'deflate') {
+          stream = proxyRes.pipe(zlib.createInflate());
+        } else if (encoding === 'br') {
+          stream = proxyRes.pipe(zlib.createBrotliDecompress());
+        }
+
         let buf = '';
 
-        proxyRes.on('data', chunk => {
+        stream.on('data', chunk => {
           const text = chunk.toString('utf8');
-          res.write(chunk);
+          res.write(text);
 
           buf += text;
           const lines = buf.split('\n');
@@ -624,11 +651,11 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
           }
         });
 
-        proxyRes.on('end', () => {
+        stream.on('end', () => {
           res.end();
         });
 
-        proxyRes.on('error', e => {
+        stream.on('error', e => {
           console.error('[proxy] 上游流式响应错误:', e.message);
           if (!res.destroyed) res.end();
         });
@@ -768,6 +795,11 @@ function convertMessagesToResponsesInput(messages = []) {
 
   for (const message of messages) {
     assertObject(message, 'message must be an object');
+
+    // Skip system messages - they should be handled via the system field
+    if (message.role === 'system') {
+      continue;
+    }
 
     if (message.role !== 'user' && message.role !== 'assistant') {
       throw new Error(`unsupported message role: ${message.role}`);
@@ -1333,6 +1365,557 @@ function forwardResponses(req, res, bodyObj, route) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OpenAI Chat Completions API 转换
+// ─────────────────────────────────────────────────────────────────────────────
+
+function convertAnthropicToOpenAIMessages(anthropicMessages = []) {
+  const openaiMessages = [];
+  
+  for (const msg of anthropicMessages) {
+    if (!msg || typeof msg !== 'object') continue;
+    
+    const role = msg.role;
+    // Skip system messages - they should be handled via the system field
+    if (role === 'system') {
+      continue;
+    }
+    if (role !== 'user' && role !== 'assistant') {
+      throw new Error(`Unsupported message role: ${role}`);
+    }
+    
+    const content = msg.content;
+    
+    // Simple text content
+    if (typeof content === 'string') {
+      openaiMessages.push({ role, content });
+      continue;
+    }
+    
+    // Array content (may include text, tool_use, tool_result, etc.)
+    if (!Array.isArray(content)) {
+      throw new Error('Message content must be string or array');
+    }
+    
+    // Collect text parts and tool calls/results
+    const textParts = [];
+    const toolCalls = [];
+    
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      
+      if (block.type === 'text') {
+        textParts.push(block.text || '');
+      } else if (block.type === 'tool_use') {
+        // Convert Anthropic tool_use to OpenAI tool_calls
+        toolCalls.push({
+          id: block.id,
+          type: 'function',
+          function: {
+            name: block.name,
+            arguments: JSON.stringify(block.input || {})
+          }
+        });
+      } else if (block.type === 'tool_result') {
+        // Convert Anthropic tool_result to OpenAI tool message
+        const toolContent = typeof block.content === 'string' 
+          ? block.content 
+          : Array.isArray(block.content)
+            ? block.content.map(c => typeof c === 'string' ? c : c.text || '').join('\n')
+            : '';
+        openaiMessages.push({
+          role: 'tool',
+          tool_call_id: block.tool_use_id,
+          content: toolContent
+        });
+      } else if (block.type === 'image') {
+        // Vision support - convert to OpenAI format
+        const imageSource = block.source;
+        if (imageSource && imageSource.type === 'base64') {
+          textParts.push({
+            type: 'image_url',
+            image_url: {
+              url: `data:${imageSource.media_type};base64,${imageSource.data}`
+            }
+          });
+        } else if (imageSource && imageSource.type === 'url') {
+          textParts.push({
+            type: 'image_url',
+            image_url: { url: imageSource.url }
+          });
+        }
+      }
+    }
+    
+    // Build the message
+    if (textParts.length > 0 || toolCalls.length > 0) {
+      const openaiMsg = { role };
+      
+      if (textParts.length > 0) {
+        // If all text parts are strings, join them
+        if (textParts.every(p => typeof p === 'string')) {
+          openaiMsg.content = textParts.join('\n');
+        } else {
+          // Mixed content (text + images)
+          openaiMsg.content = textParts.map(p => 
+            typeof p === 'string' ? { type: 'text', text: p } : p
+          );
+        }
+      } else {
+        openaiMsg.content = '';
+      }
+      
+      if (toolCalls.length > 0) {
+        openaiMsg.tool_calls = toolCalls;
+      }
+      
+      openaiMessages.push(openaiMsg);
+    }
+  }
+  
+  return openaiMessages;
+}
+
+function convertAnthropicToolsToOpenAI(anthropicTools) {
+  if (!anthropicTools || !Array.isArray(anthropicTools)) return undefined;
+  
+  return anthropicTools.map(tool => ({
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.input_schema || {}
+    }
+  }));
+}
+
+function buildOpenAIChatRequest(bodyObj, targetModel) {
+  const originalModel = bodyObj.model || '';
+  
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[${formatLogTime()}] 📨 INCOMING CLAUDE REQUEST`);
+  console.log(`${'='.repeat(80)}`);
+  console.log(`  API格式        : openai`);
+  console.log(`  收到模型名     : "${originalModel}"`);
+  console.log(`  转发模型名     : "${targetModel}"`);
+  console.log(`  stream         : ${bodyObj.stream === true}`);
+  console.log(`  tools          : ${Array.isArray(bodyObj.tools) ? bodyObj.tools.length : 0}`);
+  console.log(`  max_tokens     : ${bodyObj.max_tokens || 'not set'}`);
+  console.log(`  system field   : ${bodyObj.system ? 'YES (length: ' + (typeof bodyObj.system === 'string' ? bodyObj.system.length : JSON.stringify(bodyObj.system).length) + ')' : 'NO'}`);
+  console.log(`  messages count : ${Array.isArray(bodyObj.messages) ? bodyObj.messages.length : 0}`);
+  if (Array.isArray(bodyObj.messages)) {
+    bodyObj.messages.forEach((msg, idx) => {
+      console.log(`    [${idx}] role: ${msg.role}, content: ${typeof msg.content === 'string' ? msg.content.substring(0, 100) + '...' : Array.isArray(msg.content) ? `[${msg.content.length} blocks]` : 'unknown'}`);
+    });
+  }
+  console.log(`${'─'.repeat(80)}`);
+  
+  const messages = convertAnthropicToOpenAIMessages(bodyObj.messages || []);
+  console.log(`  ✓ Converted to ${messages.length} OpenAI messages`);
+  
+  // Prepend system message if present
+  if (bodyObj.system) {
+    const systemContent = typeof bodyObj.system === 'string'
+      ? bodyObj.system
+      : Array.isArray(bodyObj.system)
+        ? bodyObj.system.map(block => block.text || '').join('\n')
+        : '';
+    if (systemContent) {
+      messages.unshift({ role: 'system', content: systemContent });
+    }
+  }
+  
+  const openaiRequest = {
+    model: targetModel,
+    messages,
+    stream: bodyObj.stream === true
+  };
+  
+  if (bodyObj.max_tokens !== undefined) {
+    // Enforce minimum max_tokens (some providers like B.AI require > 2)
+    openaiRequest.max_tokens = Math.max(3, bodyObj.max_tokens);
+  }
+  
+  if (bodyObj.temperature !== undefined) {
+    openaiRequest.temperature = bodyObj.temperature;
+  }
+  
+  if (bodyObj.top_p !== undefined) {
+    openaiRequest.top_p = bodyObj.top_p;
+  }
+  
+  if (bodyObj.stop_sequences && Array.isArray(bodyObj.stop_sequences)) {
+    openaiRequest.stop = bodyObj.stop_sequences;
+  }
+  
+  const tools = convertAnthropicToolsToOpenAI(bodyObj.tools);
+  if (tools && tools.length > 0) {
+    openaiRequest.tools = tools;
+    
+    // Convert tool_choice if present
+    if (bodyObj.tool_choice) {
+      const tc = bodyObj.tool_choice;
+      if (typeof tc === 'string') {
+        if (tc === 'auto') openaiRequest.tool_choice = 'auto';
+        else if (tc === 'any' || tc === 'required') openaiRequest.tool_choice = 'required';
+        else if (tc === 'none') openaiRequest.tool_choice = 'none';
+      } else if (tc.type === 'tool') {
+        openaiRequest.tool_choice = {
+          type: 'function',
+          function: { name: tc.name }
+        };
+      }
+    }
+  }
+  
+  return openaiRequest;
+}
+
+function convertOpenAIToAnthropicMessage(openaiResponse, model) {
+  const choice = openaiResponse.choices && openaiResponse.choices[0];
+  if (!choice) {
+    throw new Error('OpenAI response has no choices');
+  }
+  
+  const message = choice.message;
+  const content = [];
+  
+  // Add text content
+  if (message.content) {
+    content.push({ type: 'text', text: message.content });
+  }
+  
+  // Add tool calls
+  if (message.tool_calls && Array.isArray(message.tool_calls)) {
+    for (const tc of message.tool_calls) {
+      content.push({
+        type: 'tool_use',
+        id: tc.id,
+        name: tc.function.name,
+        input: JSON.parse(tc.function.arguments || '{}')
+      });
+    }
+  }
+  
+  // Determine stop reason
+  let stopReason = 'end_turn';
+  if (choice.finish_reason === 'tool_calls') {
+    stopReason = 'tool_use';
+  } else if (choice.finish_reason === 'length') {
+    stopReason = 'max_tokens';
+  } else if (choice.finish_reason === 'stop') {
+    stopReason = 'end_turn';
+  }
+  
+  // Extract usage
+  const usage = {
+    input_tokens: openaiResponse.usage?.prompt_tokens || 0,
+    output_tokens: openaiResponse.usage?.completion_tokens || 0
+  };
+  
+  return {
+    id: openaiResponse.id || `msg_${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage
+  };
+}
+
+function handleOpenAIStream(proxyRes, res, model) {
+  res.writeHead(proxyRes.statusCode, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive'
+  });
+  
+  const state = {
+    messageId: `msg_${Date.now()}`,
+    textIndex: 0,
+    toolCallIndex: 0,
+    toolCalls: new Map(),
+    messageStarted: false,
+    contentStarted: false,
+    inputTokens: 0,
+    outputTokens: 0
+  };
+  
+  function ensureMessageStart() {
+    if (state.messageStarted) return;
+    state.messageStarted = true;
+    
+    sseWrite(res, 'message_start', {
+      type: 'message_start',
+      message: {
+        id: state.messageId,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    });
+  }
+  
+  function ensureContentStart() {
+    if (state.contentStarted) return;
+    state.contentStarted = true;
+    
+    sseWrite(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: state.textIndex,
+      content_block: { type: 'text', text: '' }
+    });
+  }
+  
+  let buffer = '';
+  let streamDone = false;
+  
+  function finalizeStream() {
+    if (streamDone) return;
+    streamDone = true;
+    
+    if (!state.messageStarted) {
+      ensureMessageStart();
+    }
+    
+    // Close text content block
+    if (state.contentStarted) {
+      sseWrite(res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index: state.textIndex
+      });
+    }
+    
+    // Close tool call blocks
+    for (const [, toolCall] of state.toolCalls) {
+      sseWrite(res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index: toolCall.index
+      });
+    }
+    
+    // Determine stop reason
+    let stopReason = 'end_turn';
+    if (state.finishReason === 'tool_calls') {
+      stopReason = 'tool_use';
+    } else if (state.finishReason === 'length') {
+      stopReason = 'max_tokens';
+    }
+    
+    sseWrite(res, 'message_delta', {
+      type: 'message_delta',
+      delta: {
+        stop_reason: stopReason,
+        stop_sequence: null
+      },
+      usage: { output_tokens: state.outputTokens }
+    });
+    
+    sseWrite(res, 'message_stop', {
+      type: 'message_stop'
+    });
+    
+    // Explicitly end the response
+    res.end();
+  }
+  
+  proxyRes.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    
+    for (const line of lines) {
+      if (!line.trim() || !line.startsWith('data: ')) continue;
+      
+      const data = line.slice(6).trim();
+      
+      // Handle [DONE] marker - finalize and end stream immediately
+      if (data === '[DONE]') {
+        finalizeStream();
+        return;
+      }
+      
+      let parsed;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      
+      const delta = parsed.choices?.[0]?.delta;
+      if (!delta) continue;
+      
+      ensureMessageStart();
+      
+      // Handle text content
+      if (delta.content) {
+        ensureContentStart();
+        sseWrite(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index: state.textIndex,
+          delta: { type: 'text_delta', text: delta.content }
+        });
+      }
+      
+      // Handle tool calls
+      if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index;
+          
+          if (!state.toolCalls.has(idx)) {
+            // New tool call
+            const toolCallIndex = state.textIndex + 1 + idx;
+            state.toolCalls.set(idx, {
+              id: tc.id || `call_${idx}`,
+              name: tc.function?.name || '',
+              argsBuffer: '',
+              index: toolCallIndex
+            });
+            
+            sseWrite(res, 'content_block_start', {
+              type: 'content_block_start',
+              index: toolCallIndex,
+              content_block: {
+                type: 'tool_use',
+                id: state.toolCalls.get(idx).id,
+                name: state.toolCalls.get(idx).name,
+                input: {}
+              }
+            });
+          }
+          
+          const toolCall = state.toolCalls.get(idx);
+          
+          // Accumulate function arguments
+          if (tc.function?.arguments) {
+            toolCall.argsBuffer += tc.function.arguments;
+            sseWrite(res, 'content_block_delta', {
+              type: 'content_block_delta',
+              index: toolCall.index,
+              delta: {
+                type: 'input_json_delta',
+                partial_json: tc.function.arguments
+              }
+            });
+          }
+        }
+      }
+      
+      // Track finish_reason
+      if (parsed.choices?.[0]?.finish_reason) {
+        state.finishReason = parsed.choices[0].finish_reason;
+      }
+      
+      // Track usage
+      if (parsed.usage) {
+        state.inputTokens = parsed.usage.prompt_tokens || 0;
+        state.outputTokens = parsed.usage.completion_tokens || 0;
+      }
+    }
+  });
+  
+  proxyRes.on('end', () => {
+    // Finalize stream if not already done (backup in case [DONE] wasn't sent)
+    finalizeStream();
+  });
+  
+  proxyRes.on('error', err => {
+    console.error('[proxy] OpenAI stream error:', err.message);
+    if (!res.destroyed && !streamDone) {
+      finalizeStream();
+    }
+  });
+}
+
+function forwardOpenAI(req, res, bodyObj, route) {
+  if (req.method !== 'POST') {
+    sendProxyError(res, 405, 'openai mode only supports POST requests');
+    return;
+  }
+  
+  let openaiRequest;
+  try {
+    openaiRequest = buildOpenAIChatRequest(bodyObj, route.targetModel);
+  } catch (e) {
+    sendProxyError(res, 400, e.message);
+    return;
+  }
+  
+  const upstreamUrl = new URL(`${route.baseUrl}/v1/chat/completions`);
+  const sendBody = Buffer.from(JSON.stringify(openaiRequest), 'utf8');
+  const isStream = openaiRequest.stream === true;
+  const upstreamHeaders = createUpstreamHeaders(upstreamUrl, sendBody, route.apiKey);
+  
+  console.log(`  🚀 Sending to upstream: ${upstreamUrl}`);
+  console.log(`  📦 Request size: ${sendBody.length} bytes`);
+  console.log(`  📋 Final messages count: ${openaiRequest.messages.length}`);
+  
+  requestUpstream(
+    upstreamUrl,
+    'POST',
+    upstreamHeaders,
+    sendBody,
+    proxyRes => {
+      if (proxyRes.statusCode >= 400) {
+        readResponseBody(proxyRes).then(errData => {
+          console.error(`\n${'!'.repeat(80)}`);
+          console.error(`  ❌ OpenAI上游错误  : ${proxyRes.statusCode}`);
+          console.error(`  上游错误内容  : ${errData.slice(0, 500)}`);
+          console.error(`${'!'.repeat(80)}\n`);
+          res.writeHead(proxyRes.statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(errData);
+        }).catch(e => {
+          console.error(`  ❌ 读取错误响应失败: ${e.message}`);
+          if (!res.headersSent) sendProxyError(res, 502, e.message);
+        });
+        return;
+      }
+      
+      if (isStream) {
+        handleOpenAIStream(proxyRes, res, route.targetModel);
+        return;
+      }
+      
+      readResponseBody(proxyRes).then(data => {
+        let parsed;
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          sendProxyError(res, 502, 'OpenAI upstream returned non-JSON');
+          return;
+        }
+        
+        if (parsed.usage) {
+          console.log(`\n  ✅ Token使用      : input=${parsed.usage.prompt_tokens || 0} output=${parsed.usage.completion_tokens || 0}`);
+          console.log(`${'='.repeat(80)}\n`);
+        }
+        
+        let anthropicMessage;
+        try {
+          anthropicMessage = convertOpenAIToAnthropicMessage(parsed, route.targetModel);
+        } catch (e) {
+          sendProxyError(res, 502, e.message);
+          return;
+        }
+        
+        sendJson(res, proxyRes.statusCode, anthropicMessage);
+      }).catch(e => {
+        if (!res.headersSent) sendProxyError(res, 502, e.message);
+      });
+    },
+    e => {
+      console.error('[proxy] OpenAI upstream request error:', e.message);
+      if (!res.headersSent) sendProxyError(res, 502, e.message);
+    }
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HTTP 服务器
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1583,6 +2166,33 @@ const ADMIN_HTML = `<!doctype html>
   .empty {
     text-align: center; color: var(--muted); padding: 24px 0; font-size: 13px;
   }
+  .provider-section {
+    margin-bottom: 16px;
+  }
+  .provider-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px; background: var(--bg); border-radius: 10px;
+    cursor: pointer; user-select: none;
+    border: 1px solid var(--border);
+    transition: background 0.15s;
+  }
+  .provider-header:hover {
+    background: color-mix(in srgb, var(--bg) 95%, var(--accent));
+  }
+  .provider-header .toggle-icon {
+    color: var(--muted); font-size: 10px; 
+    transition: transform 0.2s;
+  }
+  .provider-header strong {
+    font-size: 15px; font-weight: 600;
+  }
+  .provider-header .count {
+    color: var(--muted); font-size: 13px; margin-left: auto;
+  }
+  .provider-content {
+    padding: 12px 0 0 0;
+    display: block;
+  }
 </style>
 </head>
 <body>
@@ -1688,8 +2298,78 @@ function renderRoutes() {
     root.appendChild(el('div', { class: 'empty' }, 'No routes yet — click "Add Route" to create one.'));
     return;
   }
+  
+  // Group routes by provider (based on baseUrl domain)
+  const providers = {};
+  const providerNames = {
+    'api.tokenrouter.com': 'TokenRouter',
+    'api.xkiro.com': 'xKiro',
+    'api.justwoker.icu': 'JustDoWork',
+    'api.b.ai': 'B.AI',
+    'api.apinex.bond': 'APInex',
+    'www.getunikey.ai': 'UNIKEY',
+    'api.unorouter.com': 'UnoRouter',
+    'aihubmix.com': 'AIHubMix'
+  };
+  
   for (const [alias, r] of entries) {
-    root.appendChild(renderRoute(alias, r));
+    try {
+      const domain = new URL(r.baseUrl || 'https://unknown.com').hostname;
+      const providerName = providerNames[domain] || domain || 'Other';
+      if (!providers[providerName]) providers[providerName] = [];
+      providers[providerName].push([alias, r]);
+    } catch {
+      if (!providers['Other']) providers['Other'] = [];
+      providers['Other'].push([alias, r]);
+    }
+  }
+  
+  // Render each provider group with collapsible sections
+  const sortedProviders = Object.keys(providers).sort((a, b) => {
+    const order = ['TokenRouter', 'xKiro', 'JustDoWork', 'B.AI', 'APInex', 'UNIKEY', 'UnoRouter', 'AIHubMix'];
+    const idxA = order.indexOf(a);
+    const idxB = order.indexOf(b);
+    if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+    if (idxA !== -1) return -1;
+    if (idxB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+  
+  for (const providerName of sortedProviders) {
+    const routes = providers[providerName];
+    const providerSection = el('div', { class: 'provider-section' },
+      el('div', { class: 'provider-header', onclick: function() {
+        // Close all other sections (accordion behavior)
+        const allSections = document.querySelectorAll('.provider-section');
+        const currentContent = this.nextElementSibling;
+        const isCurrentlyClosed = currentContent.style.display === 'none';
+        
+        allSections.forEach(section => {
+          const content = section.querySelector('.provider-content');
+          const icon = section.querySelector('.toggle-icon');
+          content.style.display = 'none';
+          icon.textContent = '▶';
+        });
+        
+        // Toggle current section
+        if (isCurrentlyClosed) {
+          currentContent.style.display = 'block';
+          this.querySelector('.toggle-icon').textContent = '▼';
+        }
+      }},
+        el('span', { class: 'toggle-icon' }, '▶'),
+        el('strong', {}, providerName),
+        el('span', { class: 'count' }, \` (\${routes.length} model\${routes.length !== 1 ? 's' : ''})\`)
+      ),
+      el('div', { class: 'provider-content', style: 'display: none;' })
+    );
+    
+    const content = providerSection.querySelector('.provider-content');
+    for (const [alias, r] of routes) {
+      content.appendChild(renderRoute(alias, r));
+    }
+    
+    root.appendChild(providerSection);
   }
 }
 
@@ -1699,6 +2379,7 @@ function renderRoute(alias, r) {
   const fmt = el('select', {},
     new Option('anthropic', 'anthropic', false, r.apiFormat === 'anthropic'),
     new Option('responses', 'responses', false, r.apiFormat === 'responses'),
+    new Option('openai', 'openai', false, r.apiFormat === 'openai'),
   );
   const baseInput = el('input', { value: r.baseUrl || '', placeholder: 'https://api.deepseek.com/anthropic' });
   const sidInput = el('input', { value: r.secretId || '', placeholder: 'deepseek' });
@@ -1863,8 +2544,8 @@ function handleAdminSave(res, bodyText) {
         return adminJson(res, 400, { error: `route "${alias}" 缺字段 ${f}` });
       }
     }
-    if (def.apiFormat !== 'anthropic' && def.apiFormat !== 'responses') {
-      return adminJson(res, 400, { error: `route "${alias}" apiFormat 必须是 anthropic 或 responses` });
+    if (def.apiFormat !== 'anthropic' && def.apiFormat !== 'responses' && def.apiFormat !== 'openai') {
+      return adminJson(res, 400, { error: `route "${alias}" apiFormat 必须是 anthropic, responses 或 openai` });
     }
   }
 
@@ -2063,6 +2744,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     forwardResponses(req, res, bodyObj, route);
+    return;
+  }
+
+  if (route.apiFormat === 'openai') {
+    if (!bodyObj) {
+      sendProxyError(res, 400, 'openai mode requires a JSON request body');
+      return;
+    }
+    forwardOpenAI(req, res, bodyObj, route);
     return;
   }
 
