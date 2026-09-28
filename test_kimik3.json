@@ -1,0 +1,10 @@
+{
+  "model": "coding-kimi-k3-free",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a hello world in Python"
+    }
+  ],
+  "max_tokens": 50
+}

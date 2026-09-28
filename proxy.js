@@ -1370,6 +1370,7 @@ function forwardResponses(req, res, bodyObj, route) {
 
 function convertAnthropicToOpenAIMessages(anthropicMessages = []) {
   const openaiMessages = [];
+  let thinkingModeDetected = false;  // Track if we've seen reasoning_content before
   
   for (const msg of anthropicMessages) {
     if (!msg || typeof msg !== 'object') continue;
@@ -1387,7 +1388,12 @@ function convertAnthropicToOpenAIMessages(anthropicMessages = []) {
     
     // Simple text content
     if (typeof content === 'string') {
-      openaiMessages.push({ role, content });
+      const simpleMsg = { role, content };
+      // If thinking mode was detected and this is an assistant message, add empty reasoning_content
+      if (thinkingModeDetected && role === 'assistant') {
+        simpleMsg.reasoning_content = '';
+      }
+      openaiMessages.push(simpleMsg);
       continue;
     }
     
@@ -1399,12 +1405,17 @@ function convertAnthropicToOpenAIMessages(anthropicMessages = []) {
     // Collect text parts and tool calls/results
     const textParts = [];
     const toolCalls = [];
+    let reasoningContent = null;
     
     for (const block of content) {
       if (!block || typeof block !== 'object') continue;
       
       if (block.type === 'text') {
         textParts.push(block.text || '');
+      } else if (block.type === 'reasoning') {
+        // Preserve reasoning_content from previous responses
+        reasoningContent = block.reasoning;
+        thinkingModeDetected = true;  // Mark that we've seen reasoning_content
       } else if (block.type === 'tool_use') {
         // Convert Anthropic tool_use to OpenAI tool_calls
         toolCalls.push({
@@ -1466,6 +1477,14 @@ function convertAnthropicToOpenAIMessages(anthropicMessages = []) {
       
       if (toolCalls.length > 0) {
         openaiMsg.tool_calls = toolCalls;
+      }
+      
+      // Add reasoning_content back if it exists (for thinking mode models)
+      // OR if thinking mode was detected earlier and this is an assistant message
+      if (reasoningContent) {
+        openaiMsg.reasoning_content = reasoningContent;
+      } else if (thinkingModeDetected && role === 'assistant') {
+        openaiMsg.reasoning_content = '';  // B.AI requires reasoning_content in all assistant messages once thinking mode is active
       }
       
       openaiMessages.push(openaiMsg);
@@ -1596,6 +1615,15 @@ function convertOpenAIToAnthropicMessage(openaiResponse, model) {
     }
   }
   
+  // Preserve reasoning_content for thinking mode models (DeepSeek, etc.)
+  // Store it as a special content block so it can be passed back on subsequent requests
+  if (message.reasoning_content) {
+    content.push({
+      type: 'reasoning',
+      reasoning: message.reasoning_content
+    });
+  }
+  
   // Determine stop reason
   let stopReason = 'end_turn';
   if (choice.finish_reason === 'tool_calls') {
@@ -1639,7 +1667,10 @@ function handleOpenAIStream(proxyRes, res, model) {
     messageStarted: false,
     contentStarted: false,
     inputTokens: 0,
-    outputTokens: 0
+    outputTokens: 0,
+    reasoningContent: '',  // Track reasoning_content for thinking mode
+    reasoningIndex: null,   // Track reasoning block index
+    reasoningStarted: false // Track if reasoning block started
   };
   
   function ensureMessageStart() {
@@ -1696,6 +1727,20 @@ function handleOpenAIStream(proxyRes, res, model) {
       sseWrite(res, 'content_block_stop', {
         type: 'content_block_stop',
         index: toolCall.index
+      });
+    }
+    
+    // Add reasoning content block if present (for thinking mode)
+    if (state.reasoningContent) {
+      const reasoningIndex = state.textIndex + 1 + state.toolCalls.size;
+      sseWrite(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: reasoningIndex,
+        content_block: { type: 'reasoning', reasoning: state.reasoningContent }
+      });
+      sseWrite(res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index: reasoningIndex
       });
     }
     
@@ -1760,6 +1805,12 @@ function handleOpenAIStream(proxyRes, res, model) {
           index: state.textIndex,
           delta: { type: 'text_delta', text: delta.content }
         });
+      }
+      
+      // Handle reasoning_content for thinking mode models (DeepSeek)
+      if (delta.reasoning_content) {
+        state.reasoningContent += delta.reasoning_content;
+        // We'll add this as a content block at the end, just track it for now
       }
       
       // Handle tool calls
@@ -2567,11 +2618,9 @@ function handleAdminSave(res, bodyText) {
     }
   }
 
-  // 删除 routes 不再引用的 secretId（避免无用的 key 留在磁盘）
-  const usedSecretIds = new Set(Object.values(routes).map(r => r.secretId));
-  for (const id of Object.keys(newSecrets)) {
-    if (!usedSecretIds.has(id)) delete newSecrets[id];
-  }
+  // KEEP all API keys in secrets.json - never auto-delete unused keys
+  // Users may want to add routes back later without re-entering API keys
+  // (Removed auto-deletion code that was deleting unused secretIds)
 
   // 写文件
   try {
