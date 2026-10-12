@@ -135,7 +135,9 @@ function resolveModel(name = '') {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PROXY_HOME = process.env.MODEL_PROXY_HOME ||
-  path.join(os.homedir(), '.local', 'model-proxy');
+  (process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'model-proxy')
+    : path.join(os.homedir(), '.local', 'model-proxy'));
 const ROUTES_PATH = path.join(PROXY_HOME, 'routes.json');
 const SECRETS_PATH = path.join(PROXY_HOME, 'secrets.json');
 
@@ -544,11 +546,113 @@ function requestUpstream(upstreamUrl, method, headers, sendBody, onResponse, onE
   proxyReq.on('error', onError);
   proxyReq.write(sendBody);
   proxyReq.end();
+  return proxyReq;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Anthropic-compatible 透传
 // ─────────────────────────────────────────────────────────────────────────────
+
+function normalizeAnthropicMessages(bodyObj) {
+  if (!bodyObj) return;
+
+  let rawMessages = Array.isArray(bodyObj.messages) ? bodyObj.messages : [];
+  if (rawMessages.length === 0) {
+    bodyObj.messages = [{ role: 'user', content: 'Hello' }];
+    return;
+  }
+
+  // 1. Extract any messages with role: 'system' and merge into bodyObj.system
+  const systemParts = [];
+  const nonSystemMessages = [];
+
+  for (const msg of rawMessages) {
+    if (!msg) continue;
+    if (msg.role === 'system') {
+      const text = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.map(c => typeof c === 'string' ? c : c.text || '').join('\n')
+          : '';
+      if (text.trim()) systemParts.push(text.trim());
+    } else {
+      nonSystemMessages.push(msg);
+    }
+  }
+
+  if (systemParts.length > 0) {
+    const existingSystem = typeof bodyObj.system === 'string'
+      ? bodyObj.system
+      : Array.isArray(bodyObj.system)
+        ? bodyObj.system.map(c => typeof c === 'string' ? c : c.text || '').join('\n')
+        : '';
+    bodyObj.system = existingSystem
+      ? existingSystem + '\n\n' + systemParts.join('\n\n')
+      : systemParts.join('\n\n');
+    console.log(`  🛡️ Extracted ${systemParts.length} system messages from messages array into top-level system parameter`);
+  }
+
+  // 2. Remove any trailing empty messages
+  while (nonSystemMessages.length > 0) {
+    const last = nonSystemMessages[nonSystemMessages.length - 1];
+    const isEmpty = !last.content || 
+      (typeof last.content === 'string' && !last.content.trim()) ||
+      (Array.isArray(last.content) && last.content.length === 0);
+    if (isEmpty) {
+      nonSystemMessages.pop();
+    } else {
+      break;
+    }
+  }
+
+  if (nonSystemMessages.length === 0) {
+    bodyObj.messages = [{ role: 'user', content: 'Continue' }];
+    return;
+  }
+
+  // 3. Merge consecutive messages with the same role (user + user -> user, assistant + assistant -> assistant)
+  const alternatingMessages = [];
+  for (const msg of nonSystemMessages) {
+    const prev = alternatingMessages[alternatingMessages.length - 1];
+    if (prev && prev.role === msg.role) {
+      if (typeof prev.content === 'string' && typeof msg.content === 'string') {
+        prev.content += '\n\n' + msg.content;
+      } else {
+        const prevBlocks = Array.isArray(prev.content)
+          ? prev.content
+          : [{ type: 'text', text: String(prev.content || '') }];
+        const msgBlocks = Array.isArray(msg.content)
+          ? msg.content
+          : [{ type: 'text', text: String(msg.content || '') }];
+        prev.content = [...prevBlocks, ...msgBlocks];
+      }
+    } else {
+      alternatingMessages.push(msg);
+    }
+  }
+
+  // 4. Ensure first message is 'user'
+  if (alternatingMessages.length > 0 && alternatingMessages[0].role !== 'user') {
+    alternatingMessages.unshift({ role: 'user', content: 'Hello' });
+  }
+
+  // 5. Ensure last message is 'user'
+  const lastMsg = alternatingMessages[alternatingMessages.length - 1];
+  if (lastMsg && lastMsg.role !== 'user') {
+    if (Array.isArray(lastMsg.content)) {
+      lastMsg.content = lastMsg.content.map(c => {
+        if (c && c.type === 'tool_use') {
+          return { type: 'text', text: `[Tool call: ${c.name || 'action'}]` };
+        }
+        return c;
+      });
+    }
+    alternatingMessages.push({ role: 'user', content: 'Continue' });
+    console.log(`  🛡️ Auto-appended user turn (previous last role was: "${lastMsg.role}")`);
+  }
+
+  bodyObj.messages = alternatingMessages;
+}
 
 function buildAnthropicBody(bodyObj, targetModel) {
   const originalModel = bodyObj.model || '';
@@ -559,17 +663,250 @@ function buildAnthropicBody(bodyObj, targetModel) {
 
   bodyObj.system = normalizeSystemForCache(bodyObj.system);
   bodyObj.model = targetModel;
+  normalizeAnthropicMessages(bodyObj);
 
+  const roles = Array.isArray(bodyObj.messages) ? bodyObj.messages.map(m => m.role) : [];
   console.log(`  转发模型名     : "${targetModel}"`);
   console.log(`  stream         : ${bodyObj.stream === true}`);
   console.log(`  tools          : ${Array.isArray(bodyObj.tools) ? bodyObj.tools.length : 0}`);
+  console.log(`  messages count : ${roles.length} [roles: ${roles.slice(-4).join(' -> ')}]`);
 
   return Buffer.from(JSON.stringify(bodyObj), 'utf8');
 }
 
-function forwardAnthropic(req, res, rawBody, bodyObj, route) {
-  let sendBody = rawBody;
+function ensureVisibleContent(parsed) {
+  if (!parsed || !Array.isArray(parsed.content)) return;
+  const hasText = parsed.content.some(b => b.type === 'text' && b.text && b.text.trim());
+  const hasTool = parsed.content.some(b => b.type === 'tool_use');
+  if (!hasText && !hasTool) {
+    const thinkingBlock = parsed.content.find(b => b.type === 'thinking');
+    if (thinkingBlock && thinkingBlock.thinking) {
+      parsed.content.push({
+        type: 'text',
+        text: thinkingBlock.thinking.trim()
+      });
+      console.log('  🛡️ Surfaced thinking block as visible text output to prevent UI hang');
+    }
+  }
+}
 
+function synthesizeAnthropicStream(res, parsed, targetModel, headersAlreadySent = false, messageStartAlreadySent = false) {
+  if (!headersAlreadySent && !res.headersSent) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive'
+    });
+  }
+
+  const msgId = parsed.id || ('msg_' + Date.now());
+  const model = parsed.model || targetModel;
+  const usage = parsed.usage || {};
+
+  if (!messageStartAlreadySent) {
+    res.write('event: message_start\n');
+    res.write('data: ' + JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: msgId,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: 0
+        }
+      }
+    }) + '\n\n');
+  }
+
+  const content = Array.isArray(parsed.content) ? parsed.content : [];
+  content.forEach((block, index) => {
+    if (!block || typeof block !== 'object') return;
+
+    if (block.type === 'thinking') {
+      res.write('event: content_block_start\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'thinking', thinking: '' }
+      }) + '\n\n');
+
+      const thinking = block.thinking || '';
+      const chunkSize = 120;
+      for (let i = 0; i < thinking.length; i += chunkSize) {
+        res.write('event: content_block_delta\n');
+        res.write('data: ' + JSON.stringify({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'thinking_delta', thinking: thinking.slice(i, i + chunkSize) }
+        }) + '\n\n');
+      }
+
+      if (block.signature) {
+        res.write('event: content_block_delta\n');
+        res.write('data: ' + JSON.stringify({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'signature_delta', signature: block.signature }
+        }) + '\n\n');
+      }
+
+      res.write('event: content_block_stop\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_stop',
+        index
+      }) + '\n\n');
+    } else if (block.type === 'text') {
+      res.write('event: content_block_start\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'text', text: '' }
+      }) + '\n\n');
+
+      const text = block.text || '';
+      const chunkSize = 64;
+      for (let i = 0; i < text.length; i += chunkSize) {
+        res.write('event: content_block_delta\n');
+        res.write('data: ' + JSON.stringify({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'text_delta', text: text.slice(i, i + chunkSize) }
+        }) + '\n\n');
+      }
+
+      res.write('event: content_block_stop\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_stop',
+        index
+      }) + '\n\n');
+    } else if (block.type === 'tool_use') {
+      res.write('event: content_block_start\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'tool_use',
+          id: block.id,
+          name: block.name,
+          input: {}
+        }
+      }) + '\n\n');
+
+      res.write('event: content_block_delta\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_delta',
+        index,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: JSON.stringify(block.input || {})
+        }
+      }) + '\n\n');
+
+      res.write('event: content_block_stop\n');
+      res.write('data: ' + JSON.stringify({
+        type: 'content_block_stop',
+        index
+      }) + '\n\n');
+    }
+  });
+
+  res.write('event: message_delta\n');
+  res.write('data: ' + JSON.stringify({
+    type: 'message_delta',
+    delta: {
+      stop_reason: parsed.stop_reason || 'end_turn',
+      stop_sequence: parsed.stop_sequence || null
+    },
+    usage: {
+      output_tokens: usage.output_tokens || 0
+    }
+  }) + '\n\n');
+
+  res.write('event: message_stop\n');
+  res.write('data: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n');
+
+  res.end();
+}
+
+function estimateTokens(bodyObj) {
+  let chars = 0;
+  if (typeof bodyObj.system === 'string') chars += bodyObj.system.length;
+  else if (Array.isArray(bodyObj.system)) {
+    for (const b of bodyObj.system) chars += (typeof b === 'string' ? b : b.text || '').length;
+  }
+  if (Array.isArray(bodyObj.messages)) {
+    for (const m of bodyObj.messages) {
+      if (typeof m.content === 'string') chars += m.content.length;
+      else if (Array.isArray(m.content)) {
+        for (const b of m.content) chars += (typeof b === 'string' ? b : b.text || b.thinking || JSON.stringify(b)).length;
+      }
+    }
+  }
+  if (Array.isArray(bodyObj.tools)) {
+    chars += JSON.stringify(bodyObj.tools).length;
+  }
+  return Math.max(1, Math.ceil(chars / 3.8));
+}
+
+function forwardAnthropic(req, res, rawBody, bodyObj, route) {
+  const isStream = bodyObj?.stream === true;
+  const isJustwoker = (route.baseUrl || '').includes('justwoker.icu');
+
+  // Justwoker upstream drops content deltas during stream: true (Resolved upstream).
+  // Synthesis disabled to allow native real-time token streaming.
+  const needStreamSynthesis = false;
+  let pingTimer = null;
+  let proxyReq = null;
+  const initialMsgId = 'msg_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+  if (needStreamSynthesis) {
+    if (bodyObj) bodyObj.stream = false;
+
+    // Immediately flush headers and initial message_start so Claude Desktop's watchdog timer is satisfied!
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'connection': 'keep-alive',
+    });
+
+    res.write('event: message_start\n');
+    res.write('data: ' + JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: initialMsgId,
+        type: 'message',
+        role: 'assistant',
+        model: route.targetModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: estimateTokens(bodyObj || {}),
+          output_tokens: 0
+        }
+      }
+    }) + '\n\n');
+
+    pingTimer = setInterval(() => {
+      if (!res.destroyed && !res.writableEnded) {
+        res.write('event: ping\ndata: {"type":"ping"}\n\n');
+      }
+    }, 1500);
+
+    res.on('close', () => {
+      if (pingTimer) clearInterval(pingTimer);
+      if (proxyReq && !proxyReq.destroyed) {
+        try { proxyReq.destroy(); } catch {}
+      }
+    });
+  }
+
+  let sendBody = rawBody;
   if (req.method === 'POST' && rawBody.length > 0 && bodyObj) {
     sendBody = buildAnthropicBody(bodyObj, route.targetModel);
   }
@@ -579,6 +916,7 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
     ...req.headers,
     host: upstreamUrl.host,
     authorization: `Bearer ${route.apiKey}`,
+    ...(route.apiKey ? { 'x-api-key': route.apiKey } : {}),
     'content-length': String(sendBody.length),
   };
 
@@ -586,9 +924,17 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
     delete upstreamHeaders[h];
   }
 
-  const isStream = bodyObj?.stream === true;
+  // Prevent Cloudflare / upstream from returning zstd (magic header 0x28 '(') or unhandled compression
+  if (isJustwoker || needStreamSynthesis) {
+    upstreamHeaders['accept-encoding'] = 'identity';
+    if (!isStream || needStreamSynthesis) {
+      upstreamHeaders['accept'] = 'application/json';
+    }
+  } else if (upstreamHeaders['accept-encoding']) {
+    upstreamHeaders['accept-encoding'] = 'gzip, deflate, br';
+  }
 
-  requestUpstream(
+  proxyReq = requestUpstream(
     upstreamUrl,
     req.method,
     upstreamHeaders,
@@ -599,14 +945,60 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
       delete resHeaders['content-encoding'];  // Remove compression header (Node.js auto-decompresses)
 
       if (proxyRes.statusCode >= 400) {
+        if (pingTimer) clearInterval(pingTimer);
         readResponseBody(proxyRes).then(errData => {
           console.error(`  上游HTTP错误  : ${proxyRes.statusCode}`);
           console.error(`  上游错误内容  : ${errData.slice(0, 1000)}`);
+          console.error(`  发送的请求内容: ${sendBody.toString('utf8').slice(0, 1000)}`);
 
-          res.writeHead(proxyRes.statusCode, resHeaders);
-          res.end(errData);
+          let cleanErrMsg = 'Upstream error (' + proxyRes.statusCode + ')';
+          try {
+            const errJson = JSON.parse(errData);
+            cleanErrMsg = errJson.error?.message || errJson.message || errJson.detail || errJson.title || JSON.stringify(errJson);
+          } catch {
+            cleanErrMsg = (errData || '').replace(/<[^>]*>?/gm, '').trim() || cleanErrMsg;
+          }
+
+          if (!res.headersSent) {
+            res.writeHead(proxyRes.statusCode, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: cleanErrMsg } }));
+          } else {
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: cleanErrMsg } })}\n\n`);
+            res.end();
+          }
         }).catch(e => {
           if (!res.headersSent) sendProxyError(res, 502, e.message);
+          else if (!res.destroyed) res.end();
+        });
+        return;
+      }
+
+      if (needStreamSynthesis) {
+        if (pingTimer) clearInterval(pingTimer);
+
+        readResponseBody(proxyRes).then(data => {
+          let parsed;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            if (!res.headersSent) {
+              sendProxyError(res, 502, 'Upstream returned non-JSON response');
+            } else {
+              res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Upstream returned non-JSON response' } })}\n\n`);
+              res.end();
+            }
+            return;
+          }
+
+          if (parsed.usage) {
+            logCacheUsage(parsed.usage);
+          }
+
+          ensureVisibleContent(parsed);
+          synthesizeAnthropicStream(res, parsed, route.targetModel, true, true);
+        }).catch(e => {
+          if (!res.headersSent) sendProxyError(res, 502, e.message);
+          else if (!res.destroyed) res.end();
         });
         return;
       }
@@ -665,23 +1057,27 @@ function forwardAnthropic(req, res, rawBody, bodyObj, route) {
             const parsed = JSON.parse(data);
             if (parsed.usage) logCacheUsage(parsed.usage);
             else console.log('  缓存统计     : 响应中未找到 usage 字段');
-          } catch {
-            console.log('  缓存统计     : 响应不是 JSON，无法解析 usage');
-          }
 
-          res.writeHead(proxyRes.statusCode, resHeaders);
-          res.end(data);
+            ensureVisibleContent(parsed);
+            sendJson(res, proxyRes.statusCode, parsed);
+          } catch {
+            res.writeHead(proxyRes.statusCode, resHeaders);
+            res.end(data);
+          }
         }).catch(e => {
           if (!res.headersSent) sendProxyError(res, 502, e.message);
         });
       }
     },
     e => {
+      if (pingTimer) clearInterval(pingTimer);
       console.error('[proxy] 上游请求错误:', e.message);
 
       if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end(e.message);
+        sendProxyError(res, 502, e.message);
+      } else if (!res.destroyed) {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } })}\n\n`);
+        res.end();
       }
     }
   );
@@ -2771,6 +3167,12 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
+  }
+
+  if (req.url === '/v1/messages/count_tokens' || req.url.startsWith('/v1/messages/count_tokens')) {
+    const count = estimateTokens(bodyObj || {});
+    sendJson(res, 200, { input_tokens: count });
+    return;
   }
 
   const requestedModel = bodyObj?.model || '';
